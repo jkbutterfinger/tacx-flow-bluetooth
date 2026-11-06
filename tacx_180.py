@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import struct
 import sys
+import time
 from dataclasses import dataclass
 
 from bleak import BleakClient, BleakScanner
@@ -20,6 +22,7 @@ from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 
 FTMS_CONTROL_POINT = "00002ad9-0000-1000-8000-00805f9b34fb"
+CYCLING_POWER_MEASUREMENT = "00002a63-0000-1000-8000-00805f9b34fb"
 
 OP_REQUEST_CONTROL = 0x00
 OP_SET_TARGET_POWER = 0x05
@@ -84,6 +87,20 @@ def choose(trainers: list[Trainer], name_filter: str) -> Trainer | None:
     return matches[0]
 
 
+def parse_cycling_power(data: bytes) -> int | None:
+    """Momentane Leistung (W) aus Cycling Power Measurement (0x2A63).
+
+    Erkenntnis aus tacx_watt.py: Flags auswerten und das Int16-Feld
+    „Instantaneous Power“ (Bit 6) lesen.
+    """
+    if len(data) < 4:
+        return None
+    flags = int.from_bytes(data[0:2], "little")
+    if not flags & 0x0040:  # Bit 6: Instantaneous Power Present
+        return None
+    return struct.unpack_from("<h", data, 2)[0]
+
+
 async def run(args: argparse.Namespace) -> int:
     if args.address:
         print(f"Verbinde direkt mit {args.address} ...")
@@ -133,6 +150,7 @@ async def run(args: argparse.Namespace) -> int:
             print("  (keine Antwort – Befehl wird trotzdem gesendet)")
             return None
 
+
     try:
         async with BleakClient(device_or_address, timeout=25) as client:
             connected = True
@@ -155,16 +173,48 @@ async def run(args: argparse.Namespace) -> int:
             await send(client, OP_SET_TARGET_POWER,
                        args.watts.to_bytes(2, "little", signed=True))
 
+            # Ist-Leistung mitlesen (ähnlich wie tacx_watt.py), damit man sieht,
+            # ob der Trainer das Ziel hält.
+            actual_power: int | None = None
+            power_available = (
+                client.services.get_characteristic(CYCLING_POWER_MEASUREMENT)
+                is not None
+            )
+
+            def on_power(_: object, data: bytearray) -> None:
+                nonlocal actual_power
+                value = parse_cycling_power(bytes(data))
+                if value is not None:
+                    actual_power = value
+
+            if power_available:
+                await client.start_notify(CYCLING_POWER_MEASUREMENT, on_power)
+                await asyncio.sleep(0.2)
+
             print()
             print(f"✔ {args.watts} W als Ziel gesetzt.")
             print("  Gleichmäßig treten, nicht schalten. Der Trainer regelt den Widerstand.")
+            if power_available:
+                print("  Ist-Leistung wird mitgelesen.")
             print("  Ctrl+C beendet die Steuerung.")
             print()
 
-            if args.duration > 0:
-                await asyncio.sleep(args.duration)
-            else:
-                await asyncio.Event().wait()
+            start = time.monotonic()
+            try:
+                if args.duration > 0:
+                    while time.monotonic() - start < args.duration:
+                        if actual_power is not None:
+                            print(f"\r  Ist-Leistung: {actual_power:4d} W   ",
+                                  end="", flush=True)
+                        await asyncio.sleep(0.5)
+                else:
+                    while True:
+                        if actual_power is not None:
+                            print(f"\r  Ist-Leistung: {actual_power:4d} W   ",
+                                  end="", flush=True)
+                        await asyncio.sleep(0.5)
+            finally:
+                print()
             return 0
     except asyncio.CancelledError:
         return 0
